@@ -1,4 +1,46 @@
 --db:fhirb
+
+--- Search algorithm:
+---  * start from http query string
+---  * split & decode to params relation (param, op, value)
+---
+---  * search resources - build search query
+---    we represent query as relation  (part, sql_string),
+---    where part - SELECT, LIMIT, OFFSET, JOINS
+---
+---    * build select part - just enumeration of fixed columns
+---    * TAGS
+---      * filter _tag, _security & _profile params
+---      * JOIN string on tag aliased by md5 of value
+---      * with tag condition scheme= label=
+---    * SEARCH
+---      * build references joins
+---        * expand params
+---        * filter only chained params (i.e. having parent resource)
+---        * JOIN string with _references table and aliases by path
+---        * and condition based on ids
+---      * build index joins
+---        * filter leaf params (i.e without '.')
+---        * build join with table calculated by path
+---        * with condition by param type (custom implementations for each type)
+---    * MISSING
+---      * expand params
+---      * join with params meta info
+---      * filter out all chains '.'
+---      * take only missings
+---      * build LEFT JOIN string with index table by type
+---      * build WHERE string with IS NULL or IS NOT NULL
+---    * BY IDS
+---    * ORDER
+---       * filter sort params
+---       * build JOIN with _sort table
+---       * build ORDER part
+---    * LIMIT build offset & limit part - just LIMIT/OFFSET parts
+---    * compose query from query relation
+---  * load includes
+---    * select resources ids by _references table & search result
+---    * select included resources joining ids relation
+
 --{{{
 
 -- TODO: all by convetion
@@ -112,14 +154,13 @@ LANGUAGE sql AS $$
   ;
 $$;
 
-
 CREATE OR REPLACE
 FUNCTION _build_index_joins(_resource_type text, _query jsonb)
 RETURNS table (sql text, weight text)
 LANGUAGE sql AS $$
     WITH index_params AS (
      SELECT quote_ident(lower(p.res) || '_search_' || fri.search_type) as tbl,
-            get_alias_from_path(array_append(p.path, fri.search_type::text)) AS als,
+            get_alias_from_path(array_append(p.path, p.key::text)) AS als,
             get_alias_from_path(p.path) prnt,
             fri.param_name,
             fri.search_type,
@@ -406,6 +447,23 @@ LANGUAGE sql AS $$
   WHERE x->>'param' = '_id'
 $$;
 
+CREATE OR REPLACE FUNCTION
+_text_to_query(_text text) RETURNS text
+LANGUAGE sql AS $$
+  SELECT replace(replace(lower(_text), 'and', '&'), 'or', '|');
+$$;
+
+CREATE OR REPLACE
+FUNCTION build_full_text_search_part(_resource_type varchar, query jsonb) RETURNS table(part text, sql text)
+LANGUAGE sql AS $$
+  SELECT 'WHERE'::text,
+    'to_tsvector(''english'',' ||
+    quote_ident(lower(_resource_type)) ||
+    '."content"::text) @@ to_tsquery(' || quote_literal(_text_to_query(x->>'value')) || ')'
+  FROM jsonb_array_elements(query) x
+  WHERE x->>'param' = '_text'
+$$;
+
 CREATE OR REPLACE
 FUNCTION build_select_part(_resource_type varchar) RETURNS table(part text, sql text)
 LANGUAGE sql AS $$
@@ -431,6 +489,8 @@ LANGUAGE sql AS $$
     SELECT * FROM build_search_part(_resource_type, query)
     UNION
     SELECT * FROM build_ids_search_part(_resource_type, query)
+    UNION
+    SELECT * FROM build_full_text_search_part(_resource_type, query)
     UNION
     SELECT * FROM build_order_part(_resource_type, query)
     UNION
