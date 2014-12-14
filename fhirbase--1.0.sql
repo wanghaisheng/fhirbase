@@ -74,6 +74,35 @@ $$;
 
 
 --
+-- Name: _build_bundle(character varying, integer, json); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION _build_bundle(_title_ character varying, _total_ integer, _entry_ json) RETURNS jsonb
+    LANGUAGE sql
+    AS $$
+  SELECT  json_build_object(
+    'title', _title_,
+    'id', gen_random_uuid(),
+    'resourceType', 'Bundle',
+    'totalResults', _total_,
+    'updated', now(),
+    'entry', _entry_
+  )::jsonb;
+$$;
+
+
+--
+-- Name: _build_id(jsonb, character varying, uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION _build_id(_cfg jsonb, _type_ character varying, _id_ uuid) RETURNS character varying
+    LANGUAGE sql
+    AS $$
+  SELECT _build_url(_cfg, _type_ || '/' || _id_)
+$$;
+
+
+--
 -- Name: _build_index_joins(text, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -96,13 +125,16 @@ CREATE FUNCTION _build_index_joins(_resource_type text, _query jsonb) RETURNS TA
       WHERE position('.' in p.key) = 0
     )
     SELECT _tpl($SQL$
-            JOIN {{tbl}} {{als}}
-              ON {{als}}.resource_id::varchar = {{prnt}}.logical_id::varchar
-             AND {{cond}}
+            JOIN (
+              SELECT DISTINCT resource_id FROM {{tbl}} {{als}}
+              WHERE {{cond}}
+              LIMIT {{limit}}
+            ) {{als}} ON {{als}}.resource_id::varchar = {{prnt}}.logical_id::varchar
           $SQL$,
           'tbl',  p.tbl,
           'als',  p.als,
           'prnt', p.prnt,
+          'limit', COALESCE(_param_at(_query, '_count'), '100'),
           'cond', string_agg(
                      _param_expression(p.als,
                                        p.param_name,
@@ -304,6 +336,28 @@ CREATE FUNCTION _expand_search_params(_resource_type text, _query jsonb) RETURNS
   where res is not null
   and array_length(key_path,1) = 1
   ;
+$$;
+
+
+--
+-- Name: _extract_id(character varying); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION _extract_id(_id_ character varying) RETURNS character varying
+    LANGUAGE sql
+    AS $$
+  SELECT _last(regexp_split_to_array((regexp_split_to_array(_id_, '/_history/')::varchar[])[1], '/'));
+$$;
+
+
+--
+-- Name: _extract_vid(character varying); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION _extract_vid(_id_ character varying) RETURNS character varying
+    LANGUAGE sql
+    AS $$
+  SELECT _last(regexp_split_to_array(_id_, '/_history/'));
 $$;
 
 
@@ -603,20 +657,22 @@ CREATE FUNCTION _parse_param(_params_ text) RETURNS jsonb
     AS $$
 
 WITH initial AS (
+  -- split params by & and then split by = return (key, val) relation
   SELECT url_decode(split_part(x,'=',1)) as key,
          url_decode(split_part(x, '=', 2)) as val
     FROM regexp_split_to_table(_params_,'&') x
-  ), with_op_mod AS (
-  SELECT  _get_key(key) as key,
-          _get_modifier(key) as mod,
+), with_op_mod AS (
+  SELECT  _get_key(key) as key, -- normalize key (remove modifiers)
+          _get_modifier(key) as mod, -- extract modifier
           CASE WHEN val ~ E'^(>=|<=|<|>|~).*' THEN
-            regexp_replace(val, E'^(>=|<=|<|>|~).*','\1')
+            regexp_replace(val, E'^(>=|<=|<|>|~).*','\1') -- extract operator
           ELSE
             NULL
           END as op,
           regexp_replace(val, E'^(>|<|<=|>=|~)(.*)','\2') as val
     FROM  initial
 )
+-- build resulting array
 SELECT json_agg(
   json_build_object(
     'param', key,
@@ -802,7 +858,7 @@ CREATE FUNCTION _search_string_expression(_table character varying, _param chara
     AS $$
   SELECT CASE
     WHEN _modifier = '=' THEN
-      quote_ident(_table) || '.value ilike ' || quote_literal('%' || _value || '%')
+      quote_ident(_table) || '.value ilike ' || quote_literal('%' || _unaccent_string(_value) || '%')
     WHEN _modifier = 'exact' THEN
       quote_ident(_table) || '.value = ' || quote_literal(_value)
     END;
@@ -848,6 +904,17 @@ $$;
 
 
 --
+-- Name: _text_to_query(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION _text_to_query(_text text) RETURNS text
+    LANGUAGE sql
+    AS $$
+  SELECT replace(replace(lower(_text), 'and', '&'), 'or', '|');
+$$;
+
+
+--
 -- Name: _tpl(text, character varying[]); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -865,6 +932,19 @@ BEGIN
   END LOOP;
   RETURN result;
 END
+$$;
+
+
+--
+-- Name: _unaccent_string(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION _unaccent_string(_text text) RETURNS text
+    LANGUAGE sql
+    AS $$
+  SELECT translate(_text,
+    'âãäåāăąÁÂÃÄÅĀĂĄèééêëēĕėęěĒĔĖĘĚìíîïìĩīĭÌÍÎÏÌĨĪĬóôõöōŏőÒÓÔÕÖŌŎŐùúûüũūŭůÙÚÛÜŨŪŬŮ',
+    'aaaaaaaAAAAAAAAeeeeeeeeeeEEEEEiiiiiiiiIIIIIIIIoooooooOOOOOOOOuuuuuuuuUUUUUUUU');
 $$;
 
 
@@ -959,6 +1039,22 @@ $$;
 
 
 --
+-- Name: build_full_text_search_part(character varying, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION build_full_text_search_part(_resource_type character varying, query jsonb) RETURNS TABLE(part text, sql text)
+    LANGUAGE sql
+    AS $$
+  SELECT 'WHERE'::text,
+    'to_tsvector(''english'',' ||
+    quote_ident(lower(_resource_type)) ||
+    '."content"::text) @@ to_tsquery(' || quote_literal(_text_to_query(x->>'value')) || ')'
+  FROM jsonb_array_elements(query) x
+  WHERE x->>'param' = '_text'
+$$;
+
+
+--
 -- Name: build_ids_search_part(character varying, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -972,10 +1068,10 @@ $$;
 
 
 --
--- Name: build_limit_part(character varying, jsonb); Type: FUNCTION; Schema: public; Owner: -
+-- Name: build_limit_part(jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION build_limit_part(_resource_type character varying, query jsonb) RETURNS TABLE(part text, sql text)
+CREATE FUNCTION build_limit_part(query jsonb) RETURNS TABLE(part text, sql text)
     LANGUAGE sql
     AS $$
   SELECT 'LIMIT'::text,
@@ -1167,11 +1263,13 @@ CREATE FUNCTION build_search_query(_resource_type character varying, query jsonb
     UNION
     SELECT * FROM build_ids_search_part(_resource_type, query)
     UNION
+    SELECT * FROM build_full_text_search_part(_resource_type, query)
+    UNION
     SELECT * FROM build_order_part(_resource_type, query)
     UNION
     SELECT * FROM build_offset_part(_resource_type, query)
     UNION
-    SELECT * FROM build_limit_part(_resource_type,query)
+    SELECT * FROM build_limit_part(query)
   )
   SELECT
   _tpl($SQL$
@@ -1329,10 +1427,10 @@ $_$;
 
 
 --
--- Name: fhir_affix_tags(character varying, uuid, jsonb); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_affix_tags(jsonb, character varying, uuid, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_affix_tags(_res_type character varying, _id_ uuid, _tags jsonb) RETURNS jsonb
+CREATE FUNCTION fhir_affix_tags(_cfg jsonb, _res_type character varying, _id_ uuid, _tags jsonb) RETURNS jsonb
     LANGUAGE plpgsql
     AS $_$
 DECLARE
@@ -1381,10 +1479,10 @@ $_$;
 
 
 --
--- Name: fhir_affix_tags(character varying, uuid, uuid, jsonb); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_affix_tags(jsonb, character varying, uuid, uuid, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_affix_tags(_res_type character varying, _id_ uuid, _vid_ uuid, _tags jsonb) RETURNS jsonb
+CREATE FUNCTION fhir_affix_tags(_cfg jsonb, _res_type character varying, _id_ uuid, _vid_ uuid, _tags jsonb) RETURNS jsonb
     LANGUAGE plpgsql
     AS $_$
 DECLARE
@@ -1456,7 +1554,7 @@ SELECT json_build_object(
   'format', _cfg->'format',
   'rest', ARRAY[json_build_object(
     'mode', 'server',
-    'operation', '[ { "code": "transaction" }, { "code": "history-system" } ]',
+    'operation', ARRAY['{ "code": "transaction" }'::json, '{ "code": "history-system" }'::json],
     'cors', _cfg->'cors',
     'resource',
       (SELECT json_agg(
@@ -1467,7 +1565,7 @@ SELECT json_build_object(
             ),
             'readHistory', true,
             'updateCreate', true,
-            'operation', '[{ "code": "read" }, { "code": "vread" }, { "code": "update" }, { "code": "history-instance" }, { "code": "create" }, { "code": "history-type" } ]'::json,
+            'operation', ARRAY['{ "code": "read" }'::json, '{ "code": "vread" }'::json, '{ "code": "update" }'::json, '{ "code": "history-instance" }'::json, '{ "code": "create" }'::json, '{ "code": "history-type" }'::json],
             'searchParam',  (
               SELECT  json_agg(t.*)  FROM (
                 SELECT sp.name, sp.type, sp.documentation
@@ -1495,7 +1593,7 @@ CREATE FUNCTION fhir_create(_cfg jsonb, _type_ character varying, _resource_ jso
     AS $$
 --- Create a new resource with a server assigned id
 --- return bundle with one entry
-  SELECT fhir_read(_cfg, _type_, insert_resource(_resource_, _tags_))
+  SELECT fhir_read(_cfg, _type_, _build_id(_cfg, _type_, insert_resource(_resource_, _tags_)))
 $$;
 
 
@@ -1507,23 +1605,23 @@ COMMENT ON FUNCTION fhir_create(_cfg jsonb, _type_ character varying, _resource_
 
 
 --
--- Name: fhir_delete(jsonb, character varying, uuid); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_delete(jsonb, character varying, character varying); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_delete(_cfg jsonb, _type_ character varying, _id_ uuid) RETURNS jsonb
+CREATE FUNCTION fhir_delete(_cfg jsonb, _type_ character varying, _url_ character varying) RETURNS jsonb
     LANGUAGE sql
     AS $$
-  WITH bundle AS (SELECT fhir_read(_cfg, _type_, _id_) as bundle)
+  WITH bundle AS (SELECT fhir_read(_cfg, _type_, _url_) as bundle)
   SELECT bundle.bundle
-  FROM bundle, delete_resource(_id_, _type_);
+  FROM bundle, delete_resource(_extract_id(_url_)::uuid, _type_);
 $$;
 
 
 --
--- Name: FUNCTION fhir_delete(_cfg jsonb, _type_ character varying, _id_ uuid); Type: COMMENT; Schema: public; Owner: -
+-- Name: FUNCTION fhir_delete(_cfg jsonb, _type_ character varying, _url_ character varying); Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON FUNCTION fhir_delete(_cfg jsonb, _type_ character varying, _id_ uuid) IS 'DELETE resource by its id AND return deleted version\nReturn bundle with one deleted version entry';
+COMMENT ON FUNCTION fhir_delete(_cfg jsonb, _type_ character varying, _url_ character varying) IS 'DELETE resource by its id AND return deleted version\nReturn bundle with one deleted version entry';
 
 
 --
@@ -1537,7 +1635,7 @@ CREATE FUNCTION fhir_history(_cfg jsonb, _params_ jsonb) RETURNS jsonb
     SELECT r.content AS content,
            r.updated AS updated,
            r.published AS published,
-           r.logical_id AS id,
+           _build_id(_cfg, r.resource_type, r.logical_id) AS id,
            r.category AS category,
            json_build_array(
              _build_link(_cfg, r.resource_type, r.logical_id, r.version_id)::json
@@ -1546,16 +1644,8 @@ CREATE FUNCTION fhir_history(_cfg jsonb, _params_ jsonb) RETURNS jsonb
         SELECT * FROM resource
         UNION
         SELECT * FROM resource_history) r)
-  SELECT
-    json_build_object(
-      'title', 'History of all resources',
-      'id', gen_random_uuid(),
-      'resourceType', 'Bundle',
-      'totalResults', count(e.*),
-      'updated', now(),
-      'entry', COALESCE(json_agg(e.*), '[]'::json)
-    )::jsonb
-    FROM entry e;
+  SELECT _build_bundle('History of all resources', count(e.*)::integer, COALESCE(json_agg(e.*), '[]'::json))
+  FROM entry e;
 $$;
 
 
@@ -1577,7 +1667,7 @@ CREATE FUNCTION fhir_history(_cfg jsonb, _type_ character varying, _params_ json
     SELECT r.content AS content,
            r.updated AS updated,
            r.published AS published,
-           r.logical_id AS id,
+           _build_id(_cfg, r.resource_type, r.logical_id) AS id,
            r.category AS category,
            json_build_array(
              _build_link(_cfg, r.resource_type, r.logical_id, r.version_id)::json
@@ -1588,16 +1678,8 @@ CREATE FUNCTION fhir_history(_cfg jsonb, _type_ character varying, _params_ json
         UNION
         SELECT * FROM resource_history
          WHERE resource_type = _type_) r)
-  SELECT
-    json_build_object(
-      'title', 'History of resource with type=' || _type_,
-      'id', gen_random_uuid(),
-      'resourceType', 'Bundle',
-      'totalResults', count(e.*),
-      'updated', now(),
-      'entry', COALESCE(json_agg(e.*), '[]'::json)
-    )::jsonb
-    FROM entry e;
+  SELECT _build_bundle('History of resource with type=' || _type_, count(e.*)::integer, COALESCE(json_agg(e.*), '[]'::json))
+  FROM entry e;
 $$;
 
 
@@ -1609,17 +1691,17 @@ COMMENT ON FUNCTION fhir_history(_cfg jsonb, _type_ character varying, _params_ 
 
 
 --
--- Name: fhir_history(jsonb, character varying, uuid, jsonb); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_history(jsonb, character varying, character varying, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_history(_cfg jsonb, _type_ character varying, _id_ uuid, _params_ jsonb) RETURNS jsonb
+CREATE FUNCTION fhir_history(_cfg jsonb, _type_ character varying, _url_ character varying, _params_ jsonb) RETURNS jsonb
     LANGUAGE sql
     AS $$
   WITH entry AS (
     SELECT r.content AS content,
            r.updated AS updated,
            r.published AS published,
-           r.logical_id AS id,
+           _build_id(_cfg, r.resource_type, r.logical_id) AS id,
            r.category AS category,
            json_build_array(
              _build_link(_cfg, r.resource_type, r.logical_id, r.version_id)::json
@@ -1627,29 +1709,93 @@ CREATE FUNCTION fhir_history(_cfg jsonb, _type_ character varying, _id_ uuid, _p
       FROM (
         SELECT * FROM resource
          WHERE resource_type = _type_
-           AND logical_id = _id_
+           AND logical_id = _extract_id(_url_)::uuid
         UNION
         SELECT * FROM resource_history
          WHERE resource_type = _type_
-           AND logical_id = _id_) r)
-  SELECT
-    json_build_object(
-      'title', 'History of resource with id=' || _id_ ,
-      'id', gen_random_uuid(),
-      'resourceType', 'Bundle',
-      'totalResults', count(e.*),
-      'updated', now(),
-      'entry', COALESCE(json_agg(e.*), '[]'::json)
-    )::jsonb
-    FROM entry e;
+           AND logical_id = _extract_id(_url_)::uuid) r)
+  SELECT _build_bundle('History of resource with id=' || _extract_id(_url_), count(e.*)::integer, COALESCE(json_agg(e.*), '[]'::json))
+  FROM entry e;
 $$;
 
 
 --
--- Name: FUNCTION fhir_history(_cfg jsonb, _type_ character varying, _id_ uuid, _params_ jsonb); Type: COMMENT; Schema: public; Owner: -
+-- Name: FUNCTION fhir_history(_cfg jsonb, _type_ character varying, _url_ character varying, _params_ jsonb); Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON FUNCTION fhir_history(_cfg jsonb, _type_ character varying, _id_ uuid, _params_ jsonb) IS 'Retrieve the changes history for a particular resource with logical id (_id_)\nReturn bundle with entries representing versions';
+COMMENT ON FUNCTION fhir_history(_cfg jsonb, _type_ character varying, _url_ character varying, _params_ jsonb) IS 'Retrieve the changes history for a particular resource with logical id (_id_)\nReturn bundle with entries representing versions';
+
+
+--
+-- Name: fhir_is_deleted_resource(jsonb, character varying, character varying); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION fhir_is_deleted_resource(_cfg jsonb, _type_ character varying, _id_ character varying) RETURNS boolean
+    LANGUAGE sql
+    AS $$
+  SELECT
+  EXISTS (
+    SELECT * FROM resource_history
+     WHERE resource_type = _type_
+       AND logical_id = _id_::uuid
+  ) AND NOT EXISTS (
+    SELECT * FROM resource
+     WHERE resource_type = _type_
+       AND logical_id = _id_::uuid
+  )
+$$;
+
+
+--
+-- Name: FUNCTION fhir_is_deleted_resource(_cfg jsonb, _type_ character varying, _id_ character varying); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION fhir_is_deleted_resource(_cfg jsonb, _type_ character varying, _id_ character varying) IS 'Check resource is deleted';
+
+
+--
+-- Name: fhir_is_latest_resource(jsonb, character varying, character varying, character varying); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION fhir_is_latest_resource(_cfg jsonb, _type_ character varying, _id_ character varying, _vid_ character varying) RETURNS boolean
+    LANGUAGE sql
+    AS $$
+    SELECT EXISTS (
+      SELECT * FROM resource r
+     WHERE r.resource_type = _type_
+       AND r.logical_id = _id_::uuid
+       AND r.version_id = _vid_::uuid
+    )
+$$;
+
+
+--
+-- Name: FUNCTION fhir_is_latest_resource(_cfg jsonb, _type_ character varying, _id_ character varying, _vid_ character varying); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION fhir_is_latest_resource(_cfg jsonb, _type_ character varying, _id_ character varying, _vid_ character varying) IS 'Check if resource is latest version';
+
+
+--
+-- Name: fhir_is_resource_exists(jsonb, character varying, character varying); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION fhir_is_resource_exists(_cfg jsonb, _type_ character varying, _id_ character varying) RETURNS boolean
+    LANGUAGE sql
+    AS $$
+    SELECT EXISTS (
+      SELECT * FROM resource r
+     WHERE r.resource_type = _type_
+       AND r.logical_id = _id_::uuid
+    )
+$$;
+
+
+--
+-- Name: FUNCTION fhir_is_resource_exists(_cfg jsonb, _type_ character varying, _id_ character varying); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION fhir_is_resource_exists(_cfg jsonb, _type_ character varying, _id_ character varying) IS 'Check if resource exists';
 
 
 --
@@ -1664,21 +1810,24 @@ WITH elems AS (
          json_build_object(
            'min', e.min,
            'max', e.max,
-           'type', (SELECT json_agg(tt.*) FROM (SELECT t as code FROM unnest(e.type) t) tt)
+           'type', COALESCE((SELECT json_agg(tt.*) FROM (SELECT t as code FROM unnest(e.type) t) tt), '[]'::json)
          ) as definition
     FROM fhir.resource_elements e
    WHERE path[1]=_resource_name_
 ), params AS (
-  SELECT sp.name, sp.type, sp.documentation
+  SELECT sp.name, sp.type, sp.documentation, array_to_string(sp.path, '/') as xpath
   FROM fhir.resource_search_params sp
     WHERE sp.path[1] = _resource_name_
 )
 SELECT json_build_object(
    'name', _resource_name_,
+   'resourceType', 'Profile',
    'structure', ARRAY[json_build_object(
      'type', _resource_name_,
      'publish', true,
-     'element', (SELECT json_agg(t.*) FROM elems  t),
+     'differential', json_build_object(
+       'element', (SELECT json_agg(t.*) FROM elems  t)
+     ),
      'searchParam',  (SELECT  json_agg(t.*)  FROM params t)
    )]
 )::jsonb
@@ -1686,48 +1835,40 @@ $$;
 
 
 --
--- Name: fhir_read(jsonb, character varying, uuid); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_read(jsonb, character varying, character varying); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_read(_cfg jsonb, _type_ character varying, _id_ uuid) RETURNS jsonb
+CREATE FUNCTION fhir_read(_cfg jsonb, _type_ character varying, _url_ character varying) RETURNS jsonb
     LANGUAGE sql
     AS $$
   WITH entry AS (
     SELECT r.content AS content,
            r.updated AS updated,
            r.published AS published,
-           r.logical_id AS id,
+           _build_id(_cfg, r.resource_type, r.logical_id) AS id,
            r.category AS category,
            json_build_array(
              _build_link(_cfg, r.resource_type, r.logical_id, r.version_id)::json
            )::jsonb   AS link
       FROM resource r
      WHERE r.resource_type = _type_
-       AND r.logical_id = _id_)
-  SELECT
-    json_build_object(
-      'title', 'Concrete resource by id ' || _id_,
-      'id', gen_random_uuid(),
-      'resourceType', 'Bundle',
-      'totalResults', 1,
-      'updated', now(),
-      'entry', (SELECT json_agg(e.*) FROM entry e)
-    )::jsonb
+       AND r.logical_id = _extract_id(_url_)::uuid)
+  SELECT _build_bundle('Concrete resource by id ' || _extract_id(_url_), 1, (SELECT json_agg(e.*) FROM entry e));
 $$;
 
 
 --
--- Name: FUNCTION fhir_read(_cfg jsonb, _type_ character varying, _id_ uuid); Type: COMMENT; Schema: public; Owner: -
+-- Name: FUNCTION fhir_read(_cfg jsonb, _type_ character varying, _url_ character varying); Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON FUNCTION fhir_read(_cfg jsonb, _type_ character varying, _id_ uuid) IS 'Read the current state of the resource\nReturn bundle with only one entry for uniformity';
+COMMENT ON FUNCTION fhir_read(_cfg jsonb, _type_ character varying, _url_ character varying) IS 'Read the current state of the resource\nReturn bundle with only one entry for uniformity';
 
 
 --
--- Name: fhir_remove_tags(character varying, uuid); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_remove_tags(jsonb, character varying, uuid); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_remove_tags(_res_type character varying, _id_ uuid) RETURNS bigint
+CREATE FUNCTION fhir_remove_tags(_cfg jsonb, _res_type character varying, _id_ uuid) RETURNS bigint
     LANGUAGE sql
     AS $$
   UPDATE resource SET category = NULL
@@ -1743,10 +1884,10 @@ $$;
 
 
 --
--- Name: fhir_remove_tags(character varying, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_remove_tags(jsonb, character varying, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_remove_tags(_res_type character varying, _id_ uuid, _vid uuid) RETURNS bigint
+CREATE FUNCTION fhir_remove_tags(_cfg jsonb, _res_type character varying, _id_ uuid, _vid uuid) RETURNS bigint
     LANGUAGE sql
     AS $$
   UPDATE resource_history SET category = NULL
@@ -1770,20 +1911,12 @@ CREATE FUNCTION fhir_search(_cfg jsonb, _type_ character varying, _params_ text)
     LANGUAGE sql
     AS $$
 -- TODO build query twice
-  SELECT
-    json_build_object(
-      'title', 'Search results for ' || _params_::varchar,
-      'resourceType', 'Bundle',
-      'totalResults', (SELECT search_results_count(_type_, _params_)),
-      'updated', now(),
-      'id', gen_random_uuid(),
-      'entry', COALESCE(json_agg(z.*), '[]'::json)
-    )::jsonb as json
+  SELECT _build_bundle('Search results for ' || _params_::varchar, (SELECT search_results_count(_type_, _params_))::integer, COALESCE(json_agg(z.*), '[]'::json)) as json
   FROM
     (SELECT y.content AS content,
             y.updated AS updated,
             y.published AS published,
-            y.logical_id AS id,
+            _build_id(_cfg, y.resource_type, y.logical_id) AS id,
             y.category AS category,
             json_build_array(
               _build_link(_cfg, y.resource_type, y.logical_id, y.version_id)::json
@@ -1801,10 +1934,10 @@ COMMENT ON FUNCTION fhir_search(_cfg jsonb, _type_ character varying, _params_ t
 
 
 --
--- Name: fhir_tags(); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_tags(jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_tags() RETURNS jsonb
+CREATE FUNCTION fhir_tags(_cfg jsonb) RETURNS jsonb
     LANGUAGE sql IMMUTABLE
     AS $$
 SELECT
@@ -1819,17 +1952,17 @@ $$;
 
 
 --
--- Name: FUNCTION fhir_tags(); Type: COMMENT; Schema: public; Owner: -
+-- Name: FUNCTION fhir_tags(_cfg jsonb); Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON FUNCTION fhir_tags() IS 'Return all tags in system';
+COMMENT ON FUNCTION fhir_tags(_cfg jsonb) IS 'Return all tags in system';
 
 
 --
--- Name: fhir_tags(character varying); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_tags(jsonb, character varying); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_tags(_res_type character varying) RETURNS jsonb
+CREATE FUNCTION fhir_tags(_cfg jsonb, _res_type character varying) RETURNS jsonb
     LANGUAGE sql IMMUTABLE
     AS $$
   SELECT
@@ -1845,17 +1978,17 @@ $$;
 
 
 --
--- Name: FUNCTION fhir_tags(_res_type character varying); Type: COMMENT; Schema: public; Owner: -
+-- Name: FUNCTION fhir_tags(_cfg jsonb, _res_type character varying); Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON FUNCTION fhir_tags(_res_type character varying) IS 'Return tags for resources with type = _type_';
+COMMENT ON FUNCTION fhir_tags(_cfg jsonb, _res_type character varying) IS 'Return tags for resources with type = _type_';
 
 
 --
--- Name: fhir_tags(character varying, uuid); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_tags(jsonb, character varying, uuid); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_tags(_res_type character varying, _id_ uuid) RETURNS jsonb
+CREATE FUNCTION fhir_tags(_cfg jsonb, _res_type character varying, _id_ uuid) RETURNS jsonb
     LANGUAGE sql IMMUTABLE
     AS $$
   SELECT
@@ -1872,10 +2005,10 @@ $$;
 
 
 --
--- Name: fhir_tags(character varying, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_tags(jsonb, character varying, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_tags(_res_type character varying, _id_ uuid, _vid uuid) RETURNS jsonb
+CREATE FUNCTION fhir_tags(_cfg jsonb, _res_type character varying, _id_ uuid, _vid uuid) RETURNS jsonb
     LANGUAGE sql IMMUTABLE
     AS $$
   SELECT
@@ -1904,7 +2037,7 @@ CREATE FUNCTION fhir_transaction(_cfg jsonb, _bundle_ jsonb) RETURNS jsonb
   ), items AS (
     SELECT
       e.entry->>'id' AS id,
-      _get_vid_from_url(e.entry#>>'{link,0,href}') AS vid,
+      e.entry#>>'{link,0,href}' AS vid,
       e.entry#>>'{content,resourceType}' AS resource_type,
       e.entry->'content' AS content,
       e.entry->'category' as category,
@@ -1913,7 +2046,7 @@ CREATE FUNCTION fhir_transaction(_cfg jsonb, _bundle_ jsonb) RETURNS jsonb
   ), create_resources AS (
     SELECT i.*
     FROM items i
-    LEFT JOIN resource r on r.logical_id::text = i.id
+    LEFT JOIN resource r on r.logical_id::text = _extract_id(i.id)
     WHERE i.deleted is null and r.logical_id is null
   ), created_resources AS (
     SELECT
@@ -1927,13 +2060,13 @@ CREATE FUNCTION fhir_transaction(_cfg jsonb, _bundle_ jsonb) RETURNS jsonb
   ), update_resources AS (
     SELECT i.*
     FROM items i
-    LEFT JOIN resource r on r.logical_id::text = i.id
+    LEFT JOIN resource r on r.logical_id::text = _extract_id(i.id)
     WHERE i.deleted is null and r.logical_id is not null
   ), updated_resources AS (
     SELECT
       r.id as alternative,
-      fhir_update(_cfg, r.resource_type, (cr.entry->>'id')::uuid,
-        _get_vid_from_url(cr.entry#>>'{link,0,href}')::uuid,
+      fhir_update(_cfg, r.resource_type, cr.entry->>'id',
+        cr.entry#>>'{link,0,href}',
         _replace_references(r.content::text, rf.refs)::jsonb, '[]'::jsonb)#>'{entry,0}' as entry
     FROM create_resources r
     JOIN created_resources cr on cr.alternative = r.id
@@ -1941,7 +2074,7 @@ CREATE FUNCTION fhir_transaction(_cfg jsonb, _bundle_ jsonb) RETURNS jsonb
     UNION ALL
     SELECT
       r.id as alternative,
-      fhir_update(_cfg, r.resource_type, r.id::uuid, r.vid::uuid, _replace_references(r.content::text, rf.refs)::jsonb, r.category::jsonb)#>'{entry,0}' as entry
+      fhir_update(_cfg, r.resource_type, r.id, r.vid, _replace_references(r.content::text, rf.refs)::jsonb, r.category::jsonb)#>'{entry,0}' as entry
     FROM update_resources r, reference rf
   ), delete_resources AS (
     SELECT i.*
@@ -1953,9 +2086,9 @@ CREATE FUNCTION fhir_transaction(_cfg jsonb, _bundle_ jsonb) RETURNS jsonb
       SELECT
         r.id as alternative,
         ('{"id": "' || r.id || '"}')::jsonb as entry,
-        fhir_delete(_cfg, rs.resource_type, r.id::uuid) as deleted
+        fhir_delete(_cfg, rs.resource_type, r.id) as deleted
       FROM delete_resources r
-      JOIN resource rs on rs.logical_id::text = r.id
+      JOIN resource rs on rs.logical_id::text = _extract_id(r.id)
     ) d
   ), created AS (
     SELECT
@@ -1974,15 +2107,7 @@ CREATE FUNCTION fhir_transaction(_cfg jsonb, _bundle_ jsonb) RETURNS jsonb
       FROM deleted_resources
     ) r
   )
-  SELECT
-    json_build_object(
-      'title', 'Transaction results',
-      'resourceType', 'Bundle',
-      'totalResults', count(r.*),
-      'updated', now(),
-      'id', gen_random_uuid(),
-       'entry', COALESCE(json_agg(r.*), '[]'::json)
-    )::jsonb as json
+  SELECT _build_bundle('Transaction results', count(r.*)::integer, COALESCE(json_agg(r.*), '[]'::json)) as json
   FROM created r;
 $$;
 
@@ -1995,10 +2120,10 @@ COMMENT ON FUNCTION fhir_transaction(_cfg jsonb, _bundle_ jsonb) IS 'Update, cre
 
 
 --
--- Name: fhir_update(jsonb, character varying, uuid, uuid, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_update(jsonb, character varying, character varying, character varying, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_update(_cfg jsonb, _type_ character varying, _id_ uuid, _vid_ uuid, _resource_ jsonb, _tags_ jsonb) RETURNS jsonb
+CREATE FUNCTION fhir_update(_cfg jsonb, _type_ character varying, _url_ character varying, _location_ character varying, _resource_ jsonb, _tags_ jsonb) RETURNS jsonb
     LANGUAGE plpgsql
     AS $$
 DECLARE
@@ -2009,29 +2134,29 @@ BEGIN
   vid := (
     SELECT version_id
     FROM resource
-    WHERE logical_id = _id_);
-  IF _vid_ = vid THEN
-    PERFORM update_resource(_id_, _resource_, _tags_);
-    RETURN fhir_read(_cfg, _type_, _id_);
+    WHERE logical_id = _extract_id(_url_)::uuid);
+  IF _extract_vid(_location_)::uuid = vid THEN
+    PERFORM update_resource(_extract_id(_url_)::uuid, _resource_, _tags_);
+    RETURN fhir_read(_cfg, _type_, _url_);
   ELSE
-    RAISE EXCEPTION E'Wrong version_id %.Current is %', _vid_, vid;
+    RAISE EXCEPTION E'Wrong version_id %. Current is %', _extract_vid(_location_), vid;
   END IF;
 END
 $$;
 
 
 --
--- Name: FUNCTION fhir_update(_cfg jsonb, _type_ character varying, _id_ uuid, _vid_ uuid, _resource_ jsonb, _tags_ jsonb); Type: COMMENT; Schema: public; Owner: -
+-- Name: FUNCTION fhir_update(_cfg jsonb, _type_ character varying, _url_ character varying, _location_ character varying, _resource_ jsonb, _tags_ jsonb); Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON FUNCTION fhir_update(_cfg jsonb, _type_ character varying, _id_ uuid, _vid_ uuid, _resource_ jsonb, _tags_ jsonb) IS 'Update resource, creating new version\nReturns bundle with one entry';
+COMMENT ON FUNCTION fhir_update(_cfg jsonb, _type_ character varying, _url_ character varying, _location_ character varying, _resource_ jsonb, _tags_ jsonb) IS 'Update resource, creating new version\nReturns bundle with one entry';
 
 
 --
--- Name: fhir_vread(jsonb, character varying, uuid, uuid); Type: FUNCTION; Schema: public; Owner: -
+-- Name: fhir_vread(jsonb, character varying, character varying); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION fhir_vread(_cfg jsonb, _type_ character varying, _id_ uuid, _vid_ uuid) RETURNS jsonb
+CREATE FUNCTION fhir_vread(_cfg jsonb, _type_ character varying, _url_ character varying) RETURNS jsonb
     LANGUAGE sql
     AS $$
 --- Read the state of a specific version of the resource
@@ -2040,7 +2165,7 @@ CREATE FUNCTION fhir_vread(_cfg jsonb, _type_ character varying, _id_ uuid, _vid
     SELECT r.content AS content,
            r.updated AS updated,
            r.published AS published,
-           r.logical_id AS id,
+           _build_id(_cfg, r.resource_type, r.logical_id) AS id,
            r.category AS category,
            json_build_array(
              _build_link(_cfg, r.resource_type, r.logical_id, r.version_id)::json
@@ -2048,30 +2173,22 @@ CREATE FUNCTION fhir_vread(_cfg jsonb, _type_ character varying, _id_ uuid, _vid
       FROM (
         SELECT * FROM resource
          WHERE resource_type = _type_
-           AND logical_id = _id_
-           AND version_id = _vid_
+           AND logical_id = _extract_id(_url_)::uuid
+           AND version_id = _extract_vid(_url_)::uuid
         UNION
         SELECT * FROM resource_history
          WHERE resource_type = _type_
-           AND logical_id = _id_
-           AND version_id = _vid_) r)
-  SELECT
-    json_build_object(
-      'title', 'Version of resource by id=' || _id_ || ' vid=' || _vid_,
-      'id', gen_random_uuid(),
-      'resourceType', 'Bundle',
-      'totalResults', 1,
-      'updated', now(),
-      'entry', (SELECT json_agg(e.*) FROM entry e)
-    )::jsonb
+           AND logical_id = _extract_id(_url_)::uuid
+           AND version_id = _extract_vid(_url_)::uuid) r)
+  SELECT _build_bundle('Version of resource by id=' || _extract_id(_url_) || ' vid=' || _extract_vid(_url_), 1, (SELECT json_agg(e.*) FROM entry e));
 $$;
 
 
 --
--- Name: FUNCTION fhir_vread(_cfg jsonb, _type_ character varying, _id_ uuid, _vid_ uuid); Type: COMMENT; Schema: public; Owner: -
+-- Name: FUNCTION fhir_vread(_cfg jsonb, _type_ character varying, _url_ character varying); Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON FUNCTION fhir_vread(_cfg jsonb, _type_ character varying, _id_ uuid, _vid_ uuid) IS 'Read specific version of resource with _type_\nReturns bundle with one entry';
+COMMENT ON FUNCTION fhir_vread(_cfg jsonb, _type_ character varying, _url_ character varying) IS 'Read specific version of resource with _type_\nReturns bundle with one entry';
 
 
 --
@@ -2676,6 +2793,7 @@ DECLARE
   attrs jsonb[];
   item jsonb;
   index_vals varchar[];
+  unaccent_index_vals varchar[];
   new_val varchar;
   result jsonb[] := array[]::jsonb[];
 BEGIN
@@ -2710,7 +2828,12 @@ BEGIN
     END IF;
 
     IF array_length(index_vals, 1) > 0 THEN
-      result := array_append(result, json_build_object('param', prm.param_name, 'value', index_vals)::jsonb);
+      unaccent_index_vals := (
+        SELECT array_agg(_unaccent_string(x.part))
+        FROM (
+          SELECT unnest(index_vals) as part
+        ) x);
+      result := array_append(result, json_build_object('param', prm.param_name, 'value', unaccent_index_vals)::jsonb);
     END IF;
   END LOOP;
 
@@ -37793,6 +37916,13 @@ ALTER TABLE ONLY valueset
 
 
 --
+-- Name: adversereaction_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX adversereaction_full_text_idx ON adversereaction USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: adversereaction_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -37951,6 +38081,13 @@ CREATE INDEX adversereaction_tag_on_resource_id_and_scheme_idx ON adversereactio
 --
 
 CREATE UNIQUE INDEX adversereaction_tag_on_version_id_and_term_and_scheme_idx ON adversereaction_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: alert_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX alert_full_text_idx ON alert USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -38115,6 +38252,13 @@ CREATE UNIQUE INDEX alert_tag_on_version_id_and_term_and_scheme_idx ON alert_tag
 
 
 --
+-- Name: allergyintolerance_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX allergyintolerance_full_text_idx ON allergyintolerance USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: allergyintolerance_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -38273,6 +38417,13 @@ CREATE INDEX allergyintolerance_tag_on_resource_id_and_scheme_idx ON allergyinto
 --
 
 CREATE UNIQUE INDEX allergyintolerance_tag_on_version_id_and_term_and_scheme_idx ON allergyintolerance_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: careplan_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX careplan_full_text_idx ON careplan USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -38437,6 +38588,13 @@ CREATE UNIQUE INDEX careplan_tag_on_version_id_and_term_and_scheme_idx ON carepl
 
 
 --
+-- Name: composition_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX composition_full_text_idx ON composition USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: composition_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -38595,6 +38753,13 @@ CREATE INDEX composition_tag_on_resource_id_and_scheme_idx ON composition_tag US
 --
 
 CREATE UNIQUE INDEX composition_tag_on_version_id_and_term_and_scheme_idx ON composition_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: conceptmap_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX conceptmap_full_text_idx ON conceptmap USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -38759,6 +38924,13 @@ CREATE UNIQUE INDEX conceptmap_tag_on_version_id_and_term_and_scheme_idx ON conc
 
 
 --
+-- Name: condition_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX condition_full_text_idx ON condition USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: condition_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -38917,6 +39089,13 @@ CREATE INDEX condition_tag_on_resource_id_and_scheme_idx ON condition_tag USING 
 --
 
 CREATE UNIQUE INDEX condition_tag_on_version_id_and_term_and_scheme_idx ON condition_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: conformance_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX conformance_full_text_idx ON conformance USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -39081,6 +39260,13 @@ CREATE UNIQUE INDEX conformance_tag_on_version_id_and_term_and_scheme_idx ON con
 
 
 --
+-- Name: device_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX device_full_text_idx ON device USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: device_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -39239,6 +39425,13 @@ CREATE INDEX device_tag_on_resource_id_and_scheme_idx ON device_tag USING btree 
 --
 
 CREATE UNIQUE INDEX device_tag_on_version_id_and_term_and_scheme_idx ON device_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: deviceobservationreport_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX deviceobservationreport_full_text_idx ON deviceobservationreport USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -39403,6 +39596,13 @@ CREATE UNIQUE INDEX deviceobservationreport_tag_on_version_id_and_term_and_schem
 
 
 --
+-- Name: diagnosticorder_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX diagnosticorder_full_text_idx ON diagnosticorder USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: diagnosticorder_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -39561,6 +39761,13 @@ CREATE INDEX diagnosticorder_tag_on_resource_id_and_scheme_idx ON diagnosticorde
 --
 
 CREATE UNIQUE INDEX diagnosticorder_tag_on_version_id_and_term_and_scheme_idx ON diagnosticorder_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: diagnosticreport_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX diagnosticreport_full_text_idx ON diagnosticreport USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -39725,6 +39932,13 @@ CREATE UNIQUE INDEX diagnosticreport_tag_on_version_id_and_term_and_scheme_idx O
 
 
 --
+-- Name: documentmanifest_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX documentmanifest_full_text_idx ON documentmanifest USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: documentmanifest_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -39883,6 +40097,13 @@ CREATE INDEX documentmanifest_tag_on_resource_id_and_scheme_idx ON documentmanif
 --
 
 CREATE UNIQUE INDEX documentmanifest_tag_on_version_id_and_term_and_scheme_idx ON documentmanifest_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: documentreference_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX documentreference_full_text_idx ON documentreference USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -40047,6 +40268,13 @@ CREATE UNIQUE INDEX documentreference_tag_on_version_id_and_term_and_scheme_idx 
 
 
 --
+-- Name: encounter_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX encounter_full_text_idx ON encounter USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: encounter_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -40205,6 +40433,13 @@ CREATE INDEX encounter_tag_on_resource_id_and_scheme_idx ON encounter_tag USING 
 --
 
 CREATE UNIQUE INDEX encounter_tag_on_version_id_and_term_and_scheme_idx ON encounter_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: familyhistory_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX familyhistory_full_text_idx ON familyhistory USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -40369,6 +40604,13 @@ CREATE UNIQUE INDEX familyhistory_tag_on_version_id_and_term_and_scheme_idx ON f
 
 
 --
+-- Name: group_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX group_full_text_idx ON "group" USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: group_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -40527,6 +40769,13 @@ CREATE INDEX group_tag_on_resource_id_and_scheme_idx ON group_tag USING btree (r
 --
 
 CREATE UNIQUE INDEX group_tag_on_version_id_and_term_and_scheme_idx ON group_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: imagingstudy_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX imagingstudy_full_text_idx ON imagingstudy USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -40691,6 +40940,13 @@ CREATE UNIQUE INDEX imagingstudy_tag_on_version_id_and_term_and_scheme_idx ON im
 
 
 --
+-- Name: immunization_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX immunization_full_text_idx ON immunization USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: immunization_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -40849,6 +41105,13 @@ CREATE INDEX immunization_tag_on_resource_id_and_scheme_idx ON immunization_tag 
 --
 
 CREATE UNIQUE INDEX immunization_tag_on_version_id_and_term_and_scheme_idx ON immunization_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: immunizationrecommendation_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX immunizationrecommendation_full_text_idx ON immunizationrecommendation USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -41013,6 +41276,13 @@ CREATE UNIQUE INDEX immunizationrecommendation_tag_on_version_id_and_term_and_sc
 
 
 --
+-- Name: list_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX list_full_text_idx ON list USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: list_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -41171,6 +41441,13 @@ CREATE INDEX list_tag_on_resource_id_and_scheme_idx ON list_tag USING btree (res
 --
 
 CREATE UNIQUE INDEX list_tag_on_version_id_and_term_and_scheme_idx ON list_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: location_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX location_full_text_idx ON location USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -41335,6 +41612,13 @@ CREATE UNIQUE INDEX location_tag_on_version_id_and_term_and_scheme_idx ON locati
 
 
 --
+-- Name: media_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX media_full_text_idx ON media USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: media_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -41493,6 +41777,13 @@ CREATE INDEX media_tag_on_resource_id_and_scheme_idx ON media_tag USING btree (r
 --
 
 CREATE UNIQUE INDEX media_tag_on_version_id_and_term_and_scheme_idx ON media_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: medication_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX medication_full_text_idx ON medication USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -41657,6 +41948,13 @@ CREATE UNIQUE INDEX medication_tag_on_version_id_and_term_and_scheme_idx ON medi
 
 
 --
+-- Name: medicationadministration_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX medicationadministration_full_text_idx ON medicationadministration USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: medicationadministration_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -41815,6 +42113,13 @@ CREATE INDEX medicationadministration_tag_on_resource_id_and_scheme_idx ON medic
 --
 
 CREATE UNIQUE INDEX medicationadministration_tag_on_version_id_and_term_and_scheme_ ON medicationadministration_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: medicationdispense_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX medicationdispense_full_text_idx ON medicationdispense USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -41979,6 +42284,13 @@ CREATE UNIQUE INDEX medicationdispense_tag_on_version_id_and_term_and_scheme_idx
 
 
 --
+-- Name: medicationprescription_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX medicationprescription_full_text_idx ON medicationprescription USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: medicationprescription_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -42137,6 +42449,13 @@ CREATE INDEX medicationprescription_tag_on_resource_id_and_scheme_idx ON medicat
 --
 
 CREATE UNIQUE INDEX medicationprescription_tag_on_version_id_and_term_and_scheme_id ON medicationprescription_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: medicationstatement_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX medicationstatement_full_text_idx ON medicationstatement USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -42301,6 +42620,13 @@ CREATE UNIQUE INDEX medicationstatement_tag_on_version_id_and_term_and_scheme_id
 
 
 --
+-- Name: messageheader_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX messageheader_full_text_idx ON messageheader USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: messageheader_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -42459,6 +42785,13 @@ CREATE INDEX messageheader_tag_on_resource_id_and_scheme_idx ON messageheader_ta
 --
 
 CREATE UNIQUE INDEX messageheader_tag_on_version_id_and_term_and_scheme_idx ON messageheader_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: observation_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX observation_full_text_idx ON observation USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -42623,6 +42956,13 @@ CREATE UNIQUE INDEX observation_tag_on_version_id_and_term_and_scheme_idx ON obs
 
 
 --
+-- Name: operationoutcome_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX operationoutcome_full_text_idx ON operationoutcome USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: operationoutcome_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -42781,6 +43121,13 @@ CREATE INDEX operationoutcome_tag_on_resource_id_and_scheme_idx ON operationoutc
 --
 
 CREATE UNIQUE INDEX operationoutcome_tag_on_version_id_and_term_and_scheme_idx ON operationoutcome_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: order_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX order_full_text_idx ON "order" USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -42945,6 +43292,13 @@ CREATE UNIQUE INDEX order_tag_on_version_id_and_term_and_scheme_idx ON order_tag
 
 
 --
+-- Name: orderresponse_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX orderresponse_full_text_idx ON orderresponse USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: orderresponse_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -43103,6 +43457,13 @@ CREATE INDEX orderresponse_tag_on_resource_id_and_scheme_idx ON orderresponse_ta
 --
 
 CREATE UNIQUE INDEX orderresponse_tag_on_version_id_and_term_and_scheme_idx ON orderresponse_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: organization_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX organization_full_text_idx ON organization USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -43267,6 +43628,13 @@ CREATE UNIQUE INDEX organization_tag_on_version_id_and_term_and_scheme_idx ON or
 
 
 --
+-- Name: other_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX other_full_text_idx ON other USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: other_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -43425,6 +43793,13 @@ CREATE INDEX other_tag_on_resource_id_and_scheme_idx ON other_tag USING btree (r
 --
 
 CREATE UNIQUE INDEX other_tag_on_version_id_and_term_and_scheme_idx ON other_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: patient_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX patient_full_text_idx ON patient USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -43589,6 +43964,13 @@ CREATE UNIQUE INDEX patient_tag_on_version_id_and_term_and_scheme_idx ON patient
 
 
 --
+-- Name: practitioner_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX practitioner_full_text_idx ON practitioner USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: practitioner_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -43747,6 +44129,13 @@ CREATE INDEX practitioner_tag_on_resource_id_and_scheme_idx ON practitioner_tag 
 --
 
 CREATE UNIQUE INDEX practitioner_tag_on_version_id_and_term_and_scheme_idx ON practitioner_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: procedure_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX procedure_full_text_idx ON procedure USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -43911,6 +44300,13 @@ CREATE UNIQUE INDEX procedure_tag_on_version_id_and_term_and_scheme_idx ON proce
 
 
 --
+-- Name: profile_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX profile_full_text_idx ON profile USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: profile_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -44069,6 +44465,13 @@ CREATE INDEX profile_tag_on_resource_id_and_scheme_idx ON profile_tag USING btre
 --
 
 CREATE UNIQUE INDEX profile_tag_on_version_id_and_term_and_scheme_idx ON profile_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: provenance_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX provenance_full_text_idx ON provenance USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -44233,6 +44636,13 @@ CREATE UNIQUE INDEX provenance_tag_on_version_id_and_term_and_scheme_idx ON prov
 
 
 --
+-- Name: query_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX query_full_text_idx ON query USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: query_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -44391,6 +44801,13 @@ CREATE INDEX query_tag_on_resource_id_and_scheme_idx ON query_tag USING btree (r
 --
 
 CREATE UNIQUE INDEX query_tag_on_version_id_and_term_and_scheme_idx ON query_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: questionnaire_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX questionnaire_full_text_idx ON questionnaire USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -44555,6 +44972,13 @@ CREATE UNIQUE INDEX questionnaire_tag_on_version_id_and_term_and_scheme_idx ON q
 
 
 --
+-- Name: relatedperson_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX relatedperson_full_text_idx ON relatedperson USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: relatedperson_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -44713,6 +45137,13 @@ CREATE INDEX relatedperson_tag_on_resource_id_and_scheme_idx ON relatedperson_ta
 --
 
 CREATE UNIQUE INDEX relatedperson_tag_on_version_id_and_term_and_scheme_idx ON relatedperson_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: securityevent_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX securityevent_full_text_idx ON securityevent USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -44877,6 +45308,13 @@ CREATE UNIQUE INDEX securityevent_tag_on_version_id_and_term_and_scheme_idx ON s
 
 
 --
+-- Name: specimen_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX specimen_full_text_idx ON specimen USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: specimen_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -45035,6 +45473,13 @@ CREATE INDEX specimen_tag_on_resource_id_and_scheme_idx ON specimen_tag USING bt
 --
 
 CREATE UNIQUE INDEX specimen_tag_on_version_id_and_term_and_scheme_idx ON specimen_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: substance_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX substance_full_text_idx ON substance USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -45199,6 +45644,13 @@ CREATE UNIQUE INDEX substance_tag_on_version_id_and_term_and_scheme_idx ON subst
 
 
 --
+-- Name: supply_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX supply_full_text_idx ON supply USING gin (to_tsvector('english'::regconfig, (content)::text));
+
+
+--
 -- Name: supply_logical_id_as_varchar_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
 --
 
@@ -45357,6 +45809,13 @@ CREATE INDEX supply_tag_on_resource_id_and_scheme_idx ON supply_tag USING btree 
 --
 
 CREATE UNIQUE INDEX supply_tag_on_version_id_and_term_and_scheme_idx ON supply_tag USING btree (resource_id, resource_version_id, term, scheme);
+
+
+--
+-- Name: valueset_full_text_idx; Type: INDEX; Schema: public; Owner: -; Tablespace: 
+--
+
+CREATE INDEX valueset_full_text_idx ON valueset USING gin (to_tsvector('english'::regconfig, (content)::text));
 
 
 --
@@ -49003,16 +49462,6 @@ SET search_path = fhir, pg_catalog;
 --
 
 REFRESH MATERIALIZED VIEW resource_indexables;
-
-
---
--- Name: public; Type: ACL; Schema: -; Owner: -
---
-
-REVOKE ALL ON SCHEMA public FROM PUBLIC;
-REVOKE ALL ON SCHEMA public FROM devel;
-GRANT ALL ON SCHEMA public TO devel;
-GRANT ALL ON SCHEMA public TO PUBLIC;
 
 
 --

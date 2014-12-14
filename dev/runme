@@ -38,13 +38,14 @@ function install_cmd {
 function test_cmd {
   echo "Run tests"
   failed=()
+  outdir="/tmp/fhirbase-tests"
 
-  rm -rf out
-  mkdir out
+  rm -rf $outdir
+  mkdir $outdir
   for script in `ls test/*_test.sql`; do
     nm=`basename $script`
     example="expected/$nm.out"
-    out="out/$nm.out"
+    out="$outdir/$nm.out"
     echo "run $nm"
     cat $script | psql $PSQL_ARGS -e -d $DB > $out
     if diff -Bb $out $example
@@ -73,9 +74,10 @@ function test_cmd {
 }
 
 function build_cmd {
-  # install_cmd 'build_fhir'
+  install_cmd 'build_fhir'
   pg_dump $PSQL_ARGS \
     --format=plain \
+    --no-acl \
     --no-owner \
     --file=../fhirbase--1.0.sql \
     'build_fhir' \
