@@ -37,10 +37,10 @@ SELECT assert(
 SELECT assert_eq(
    _subpath('{1,2,3}'::varchar[], '{1,2,3,4,5}'::varchar[])
   , '{4,5}'::varchar[]
-  , '_is_descedant');
-    assert_eq     
-------------------
- OK _is_descedant
+  , '_subpath');
+  assert_eq  
+-------------
+ OK _subpath
 (1 row)
 
 SELECT assert_eq(
@@ -157,5 +157,23 @@ SELECT assert_eq(ARRAY['a,b','c,d'],
         assert_eq        
 -------------------------
  OK _fhir_spilt_to_table
+(1 row)
+
+SELECT assert_eq(2,
+  jsonb_array_length(_merge_tags('[{"scheme": "http://pt.com", "term": "http://pt/vip", "label":"pt"}]'::jsonb, '[{"scheme": "http://pt2.com", "term": "http://pt/vip2", "label":"pt2"}]'::jsonb)),
+  '_merge_tags'
+);
+   assert_eq    
+----------------
+ OK _merge_tags
+(1 row)
+
+SELECT assert_eq(1,
+  jsonb_array_length(_merge_tags('[{"scheme": "http://pt.com", "term": "http://pt/vip", "label":"pt"}]'::jsonb, '[{"scheme": "http://pt.com", "term": "http://pt/vip", "label":"pt"}]'::jsonb)),
+  '_merge_tags'
+);
+   assert_eq    
+----------------
+ OK _merge_tags
 (1 row)
 

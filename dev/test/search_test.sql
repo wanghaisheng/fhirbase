@@ -1,6 +1,4 @@
---db:fhirb -e
-SET escape_string_warning=off;
-
+--db:fhirb
 --{{{
 \set org1 `cat test/fixtures/org1.json`
 \set org_uuid '550e8400-e29b-41d4-a716-446655440009'
@@ -21,103 +19,59 @@ SET escape_string_warning=off;
 
 BEGIN;
 
-SELECT insert_resource(:'org_uuid'::uuid, :'org1'::jsonb, '[]'::jsonb);
-SELECT insert_resource(:'pt_uuid'::uuid, :'pt'::jsonb, :'pt_tags'::jsonb);
-SELECT insert_resource(:'pt2_uuid'::uuid, :'pt2'::jsonb, :'pt2_tags'::jsonb);
-SELECT insert_resource(:'doc_ref_uuid'::uuid, :'doc_ref'::jsonb, '[]'::jsonb);
+INSERT into organization (logical_id, content) values (:'org_uuid', :'org1'::jsonb);
+INSERT into patient (logical_id,content) values (:'pt_uuid',  format(:'pt', :'org_uuid')::jsonb);
+INSERT into patient (logical_id,content) values (:'pt2_uuid', :'pt2'::jsonb);
 
-SELECT assert_eq(:'pt_uuid', logical_id, 'pt found by name')
-  FROM search('Patient', 'name=roel');
+SELECT assert_eq(
+  :'pt_uuid',
+  (SELECT string_agg(logical_id::text,' ') FROM search('Patient', 'name=roel')),
+  'find pt');
 
-SELECT assert_eq(:'pt_uuid', logical_id, 'pt found by identifier')
-  FROM search('Patient', 'identifier=123456789');
+SELECT assert_eq(
+  :'pt_uuid',
+  (SELECT string_agg(logical_id::text,' ') FROM search('Patient', 'identifier=123456789')),
+  'search by identifier');
 
-SELECT build_search_query('Patient', _parse_param('identifier=MRN|7777777'));
+SELECT assert_eq(
+  :'pt_uuid',
+  (SELECT string_agg(logical_id::text,' ') FROM search('Patient', 'provider=' || :'org_uuid')),
+  'search by provider');
 
-SELECT assert_eq(:'pt_uuid',
- (SELECT logical_id
-    FROM search('Patient', 'identifier=MRN|7777777'))
- ,'pt found by mrn');
+SELECT assert_eq(
+  :'pt_uuid',
+  (SELECT string_agg(logical_id::text,' ') FROM search('Patient', 'provider=' || :'org_uuid')),
+  'search by provider');
 
-SELECT assert_eq(:'pt_uuid', logical_id, 'pt found by status')
-  FROM search('Patient', 'active=true');
+SELECT assert_eq( NULL ,
+  (SELECT string_agg(logical_id::text,' ') FROM search('Patient', 'provider=nonexist')),
+  'search by nonexisting provider');
 
-SELECT assert_eq(:'pt_uuid', logical_id, 'pt found by status')
-  FROM search('Patient', 'active=true');
+SELECT assert_eq(2::bigint ,
+  (SELECT count(*) FROM search('Patient', '')),
+  'count patients');
 
-SELECT assert_eq(:'pt_uuid',
- (SELECT logical_id
-    FROM search('Patient', 'telecom=+31612345678'))
- ,'pt found by phone');
+SELECT assert_eq(1::bigint ,
+  (SELECT count(*) FROM search('Patient', '_count=1')),
+  'count patients with limit');
 
-SELECT build_search_query('Patient', _parse_param('telecom:missing=true'));
+SELECT assert_eq(1::bigint ,
+  (SELECT count(*) FROM search('Patient', format('_id=%s', :'pt_uuid'))),
+  'search by id');
 
-SELECT assert_eq(:'pt2_uuid',
- (SELECT string_agg(logical_id::text,'|')
-    FROM search('Patient', 'telecom:missing=true'))
- ,'test missing true');
+SELECT assert_eq(2::bigint ,
+  (SELECT count(*) FROM search('Patient', format('_id=%s,%s', :'pt_uuid', :'pt2_uuid'))),
+  'search by ids');
 
-SELECT assert_eq(:'pt_uuid',
- (SELECT string_agg(logical_id::text,'|')
-    FROM search('Patient', 'telecom:missing=false'))
- ,'test missing false');
+SELECT content#>'{name,0,given}' FROM search('Patient', '_sort=given');
+SELECT content#>'{name,0,given}' FROM search('Patient', '_sort:desc=given');
 
-
-SELECT assert_eq(:'pt_uuid',
- (SELECT logical_id
-    FROM search('Patient', 'gender=http://snomed.info/sct|248153007'))
- ,'pt found by snomed gender');
-
-SELECT assert_eq(:'pt_uuid',
- (SELECT logical_id
-    FROM search('Patient', 'birthdate=1960'))
- ,'pt found birthdate');
-
-
-SELECT assert_eq(:'org_uuid',
- (SELECT logical_id
-    FROM search('Organization', 'name=Health Level'))
- ,'org by name');
-
-SELECT assert_eq(:'pt_uuid',
- (SELECT logical_id
-    FROM search('Patient', 'provider.name=Health%20Level') LIMIT 1)
- ,'pt by org name');
-
-SELECT assert_eq(:'pt_uuid',
- (SELECT logical_id
-    FROM search('Patient', 'name=Roelof&provider.name=Health%20Level'))
- ,'pt by name & org name');
-
-
-SELECT assert_eq(:'pt_uuid',
- (SELECT logical_id
-    FROM search('Patient', 'family=bor') LIMIT 1)
- ,'pt by family');
-
-SELECT assert_eq(:'pt_uuid',
- (SELECT logical_id
-    FROM search('Patient', 'family=bor&name=bor') LIMIT 1)
- ,'pt by family & name');
-
-
-SELECT assert_eq('http://pt/vip',
- (SELECT string_agg(jsonb_array_elements#>>'{category,0,term}','')
-    FROM jsonb_array_elements(
-            fhir_search(:'cfg'::jsonb,
-              'Patient'::varchar, '_tag=http%3A%2F%2Fpt%2Fvip')->'entry'))
- ,'pt by tag');
-
-SELECT assert_eq(:'doc_ref_uuid',
-   (SELECT string_agg(logical_id::varchar, '|')),
-  'search number')
-  FROM search('DocumentReference', 'size=>100');
-
-SELECT assert_eq(NULL,
-   (SELECT string_agg(logical_id::varchar, '|')),
-  'search number')
-  FROM search('DocumentReference', 'size=<100');
+SELECT content#>'{birthDate}' FROM search('Patient', '_sort=birthdate');
+SELECT content#>'{birthDate}' FROM search('Patient', '_sort:desc=birthdate');
 
 ROLLBACK;
 --}}}
-
+--{{{
+select build_search_query('Patient', '_id=4');
+select build_search_query('Patient', 'provider._id=4');
+--}}}
