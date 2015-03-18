@@ -8,3 +8,9 @@
 /tmp
 dev/performance/observations.sql
 *.fixture.sql
+dev/test.log
+dev/perf/observations.sql
+old/*
+.tmp
+*.pyc
+dist

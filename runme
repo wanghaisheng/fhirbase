@@ -1,0 +1,114 @@
+#!/usr/bin/env python
+
+import ql
+import os
+import ql.prepr
+import ql.migrate
+from ql.pg import psql
+import sys
+import glob
+
+if 'DB' in os.environ:
+    db = os.environ['DB']
+else:
+    print "Please set env DB=?"
+    exit(1)
+
+def each_file(fls,cb):
+    for fl in sorted(fls):
+        if os.path.isfile(fl):
+            cb(fl)
+        else:
+            print 'Could not fild file %s' % fl
+
+def run_tests(args):
+    load(['./src/tests.sql'])
+    if not args:
+        args = glob.glob('./test/*_spec.sql')
+
+    psql(db, 'SELECT tests.start()')
+    def run(fl):
+        ql.reload_test(db, fl)
+
+    each_file(args,run)
+    res = psql(db, 'SELECT tests.fail()')
+    if res['returncode'] != 0:
+        print ql.hl('red','FAILED TESTS')
+        report = psql(db, 'SELECT * from tests.report()')['stdout']
+        print ql.hl('red', report)
+        sys.exit(1)
+    else:
+        print ql.hl('green','All tests passed')
+
+def compile(args):
+    def run(fl):
+        f = open(fl)
+        print '-- FILE: %s' % fl
+        print ql.prepr.process(fl, f.read())
+        f.close
+    each_file(args,run)
+
+def reload(args):
+    if not args: args = glob.glob('./src/**/*.sql')
+    def run(fl): ql.reload(db, fl, True)
+    each_file(args,run)
+
+def load(args):
+    if not args: args = glob.glob('./src/**/*.sql')
+    def run(fl): ql.reload(db, fl)
+    each_file(args,run)
+
+def integrate(args):
+    print psql('postgres','drop database if exists %s' % db)['stdout']
+    print psql('postgres','create database %s' % db)['stdout']
+    migrate(args)
+    run_tests([])
+
+def build(args):
+    integrate(args)
+    ql.pgdump(db)
+
+def install(args):
+    print 'TODO'
+
+
+def migrate(args):
+    ql.migrate.migrate(db)
+
+def perf(args):
+    perf_files = glob.glob('./perf/*.sql')
+    reload(perf_files)
+
+    if not 'patients_total_count' in os.environ:
+        os.environ['patients_total_count'] = '10000'
+    if not args: args = glob.glob('./perf/*.sql')
+
+    r = psql(db, """\\timing
+                 \set rand_seed `echo ${rand_seed:-0.321}`
+                 SELECT setseed(:'rand_seed'::float);
+                 SELECT performance.insert_organizations();
+                 SELECT performance.insert_practitioner(%(practitioners_count)s);
+                 SELECT performance.insert_patients(%(patients_count)s);
+                 SELECT performance.insert_encounters();
+                 SELECT count(*) FROM patient;""" \
+                 % {'practitioners_count':200,
+                    'patients_count':os.environ['patients_total_count']})
+    print r["stdout"]
+
+commands = dict(test=run_tests, compile=compile, load=load, reload=reload, integrate=integrate, build=build, migrate=migrate, perf=perf)
+
+if len(sys.argv) < 2:
+  print "Please use command:"
+  print commands.keys()
+  exit(1)
+
+cmd = sys.argv[1]
+
+
+print cmd
+if cmd in commands:
+    print 'run command %s' % cmd
+    commands[cmd](sys.argv[2:])
+else:
+    print 'Unknown command %s' % cmd
+    print commands
